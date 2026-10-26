@@ -4,7 +4,7 @@ import SwiftUI
 
 // Menu bar app: [gauge] 5h/2% 7d/17% | [clock] 5h/2h 7d/2d 19h, each small label stacked above its value.
 // Reads the Claude Code login from the macOS Keychain and polls Anthropic's OAuth usage endpoint.
-// When the menu bar has no room for the item, the stats move into an island around the notch.
+// When the menu bar has no room for the item, the stats move into an island at the top of every display.
 
 struct Window {
     let utilization: Double?
@@ -187,10 +187,10 @@ final class ClickThroughHostingView<Content: View>: NSHostingView<Content> {
 // MARK: Notch island
 
 struct IslandMetrics: Equatable {
-    var notch = CGSize(width: 0, height: 24)   // the hardware notch, or zero width on screens without one
+    var notch = CGSize(width: 0, height: 24)   // the hardware notch, or a stand-in on screens without one
     var midX: CGFloat = 0                      // notch center in screen coordinates
     var top: CGFloat = 0                       // top edge of the screen
-    static let wing: CGFloat = 34              // room for the icon beside the notch when collapsed
+    static let standInWidth: CGFloat = 100     // width of the stand-in notch on screens without one
     static let ear: CGFloat = 14               // widest top "ear" curve, outside the island body
     static let margin: CGFloat = 30            // room for the shadow
 
@@ -202,15 +202,16 @@ struct IslandMetrics: Equatable {
             notch = CGSize(width: frame.width - left.width - right.width, height: screen.safeAreaInsets.top)
             midX = frame.minX + left.width + notch.width / 2
         } else {
-            // No notch: hang a stand-in island from the middle of the menu bar.
+            // No notch: hang a stand-in notch from the middle of the menu bar, so there is something to hover.
             let menuBar = frame.maxY - screen.visibleFrame.maxY
-            notch = CGSize(width: 0, height: menuBar > 0 ? menuBar : 24)
+            notch = CGSize(width: Self.standInWidth, height: menuBar > 0 ? menuBar : 24)
             midX = frame.midX
         }
         top = frame.maxY
     }
 
-    var collapsed: CGSize { CGSize(width: notch.width + Self.wing * 2, height: notch.height) }
+    // Collapsed, the island is just the notch itself and shows nothing until hovered.
+    var collapsed: CGSize { notch }
     var expanded: CGSize { CGSize(width: max(notch.width + 290, 340), height: notch.height + 160) }
     var panel: CGSize { CGSize(width: expanded.width + (Self.ear + Self.margin) * 2, height: expanded.height + Self.margin) }
 
@@ -258,19 +259,12 @@ struct IslandView: View {
     @ObservedObject var model: IslandModel
 
     private var size: CGSize { model.expanded ? model.metrics.expanded : model.metrics.collapsed }
-    private var ear: CGFloat { model.expanded ? IslandMetrics.ear : 6 }
+    private var ear: CGFloat { model.expanded ? IslandMetrics.ear : 0 }
 
     var body: some View {
         VStack(spacing: 0) {
-            ZStack {
-                if model.expanded {
-                    expandedHeader.transition(.opacity)
-                } else {
-                    collapsedHeader.transition(.opacity)
-                }
-            }
-            .frame(height: model.metrics.notch.height)
             if model.expanded {
+                expandedHeader.frame(height: model.metrics.notch.height).transition(.opacity)
                 details.transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
             }
         }
@@ -278,7 +272,7 @@ struct IslandView: View {
         .frame(width: size.width, height: size.height, alignment: .top)
         .clipped()
         .background(
-            IslandShape(ear: ear, radius: model.expanded ? 28 : 10)
+            IslandShape(ear: ear, radius: model.expanded ? 28 : 8)
                 // Black at the top so it merges with the notch, fading slightly towards the bottom.
                 .fill(LinearGradient(colors: [.black, .black.opacity(0.82)], startPoint: .top, endPoint: .bottom))
                 .frame(width: size.width + ear * 2)
@@ -287,18 +281,6 @@ struct IslandView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .environment(\.colorScheme, .dark)
         .animation(.spring(response: 0.42, dampingFraction: 0.8), value: model.expanded)
-    }
-
-    // Just the usage icon left of the notch (centered when there is none); it turns orange if a refresh failed.
-    private var collapsedHeader: some View {
-        let hasNotch = model.metrics.notch.width > 0
-        return HStack(spacing: 0) {
-            Image(systemName: Palette.limitSymbol)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(model.snapshot.error == nil ? .white.opacity(0.9) : .orange)
-            if hasNotch { Spacer(minLength: model.metrics.notch.width) }
-        }
-        .frame(maxWidth: .infinity, alignment: hasNotch ? .leading : .center)
     }
 
     private var expandedHeader: some View {
@@ -420,7 +402,9 @@ final class IslandPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
+// One island on one display: around the notch, or hanging from the middle of the menu bar.
 final class IslandController {
+    private let screen: NSScreen
     private let model = IslandModel()
     private let panel = IslandPanel()
     private var monitors: [Any] = []
@@ -428,7 +412,8 @@ final class IslandController {
     private var collapseWork: DispatchWorkItem?
     private(set) var isShown = false
 
-    init(onRefresh: @escaping () -> Void, onMenu: @escaping () -> Void) {
+    init(screen: NSScreen, onRefresh: @escaping () -> Void, onMenu: @escaping () -> Void) {
+        self.screen = screen
         model.onRefresh = onRefresh
         model.onMenu = onMenu
         let host = IslandHostingView(rootView: IslandView(model: model))
@@ -460,9 +445,15 @@ final class IslandController {
         }
     }
 
-    // Prefer the screen with a notch; otherwise the one that holds the menu bar.
-    func layout() {
-        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.screens.first else { return }
+    func close() {
+        isShown = false
+        stopTracking()
+        exitTimer?.invalidate()
+        collapseWork?.cancel()
+        panel.orderOut(nil)
+    }
+
+    private func layout() {
         let metrics = IslandMetrics(screen: screen)
         model.metrics = metrics
         let size = metrics.panel
@@ -545,9 +536,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private let islandMenu = NSMenu()
     private let titleView = ClickThroughHostingView(rootView: MenuBarView(snapshot: UsageSnapshot()))
-    private lazy var island = IslandController(
-        onRefresh: { [weak self] in self?.refresh() },
-        onMenu: { [weak self] in self?.menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) })
+    private var islands: [IslandController] = []
+    private var snapshot = UsageSnapshot()
     private var islandCheck: DispatchWorkItem?
 
     private var islandMode: IslandMode {
@@ -561,6 +551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.addSubview(titleView)
         }
         buildMenu()
+        makeIslands()
         render()
         updateIsland()
         refresh()
@@ -637,13 +628,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func render() {
-        let snapshot = UsageSnapshot(usage: lastUsage, error: lastError, updated: lastUpdated)
+        snapshot = UsageSnapshot(usage: lastUsage, error: lastError, updated: lastUpdated)
         titleView.rootView = MenuBarView(snapshot: snapshot)
         titleWidth = ceil(titleView.fittingSize.width)
         statusItem.length = titleWidth
         titleView.frame = NSRect(x: 0, y: 0, width: titleWidth,
                                  height: statusItem.button?.bounds.height ?? NSStatusBar.system.thickness)
-        island.update(snapshot)
+        islands.forEach { $0.update(snapshot) }
 
         var status = lastUpdated.map { "Updated " + Self.timeFormatter.string(from: $0) } ?? "Not updated yet"
         if let error = lastError { status += " — \(error)" }
@@ -665,8 +656,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func screensChanged() {
-        if island.isShown { island.layout() }
+        makeIslands()
         scheduleIslandCheck()
+    }
+
+    // The menu bar item can't be hidden on just one display, so when the stats leave the menu bar
+    // every display gets an island; otherwise displays without a notch would show nothing.
+    private func makeIslands() {
+        islands.forEach { $0.close() }
+        islands = NSScreen.screens.map { screen in
+            let island = IslandController(
+                screen: screen,
+                onRefresh: { [weak self] in self?.refresh() },
+                onMenu: { [weak self] in self?.menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) })
+            island.update(snapshot)
+            return island
+        }
     }
 
     // Debounced, because the menu bar shuffles items around briefly while apps launch and switch.
@@ -686,7 +691,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .automatic: showIsland = statsWouldHideIcons()
         }
         if statusItem.isVisible == showIsland { statusItem.isVisible = !showIsland }
-        island.setShown(showIsland)
+        islands.forEach { $0.setShown(showIsland) }
     }
 
     // Whether the stats plus every other menu bar icon are wider than the space right of the notch,
@@ -717,7 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             others += bounds.width
         }
         // A little slack once the island is up, so a few points of change don't bounce the stats back and forth.
-        let slack: CGFloat = island.isShown ? 8 : 0
+        let slack: CGFloat = islands.contains(where: \.isShown) ? 8 : 0
         return others + titleWidth > space - slack
     }
 
