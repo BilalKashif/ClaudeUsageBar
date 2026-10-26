@@ -1,8 +1,10 @@
 import AppKit
 import ServiceManagement
+import SwiftUI
 
-// Menu bar app: "Limit: 5h 2% 7d 17%  |  Reset on: 5h 2h 7d 2d 19h"
+// Menu bar app: [gauge] 5h/2% 7d/17% | [clock] 5h/2h 7d/2d 19h, each small label stacked above its value.
 // Reads the Claude Code login from the macOS Keychain and polls Anthropic's OAuth usage endpoint.
+// When the menu bar has no room for the item, the stats move into an island around the notch.
 
 struct Window {
     let utilization: Double?
@@ -89,89 +91,13 @@ final class UsageClient {
 }
 
 enum UsageFormatter {
-    enum Style { case plain, label, limit, reset, bar(Double) }
-
-    static func segments(_ usage: Usage, _ now: Date) -> [(String, Style)] {
-        [
-            ("Limit: ", .plain),
-            ("5h ", .label), (textBar(usage.fiveHour) + " ", .bar(fraction(usage.fiveHour))),
-            (percent(usage.fiveHour) + " ", .limit),
-            ("7d ", .label), (textBar(usage.sevenDay) + " ", .bar(fraction(usage.sevenDay))),
-            (percent(usage.sevenDay), .limit),
-            ("  |  Reset on: ", .plain),
-            ("5h ", .label), (countdown(usage.fiveHour, now) + " ", .reset),
-            ("7d ", .label), (countdown(usage.sevenDay, now), .reset),
-        ]
-    }
-
     static func titleText(_ usage: Usage, _ now: Date) -> String {
-        segments(usage, now).map(\.0).joined()
+        "Limit: 5h \(percent(usage.fiveHour)) 7d \(percent(usage.sevenDay))"
+            + "  |  Reset on: 5h \(countdown(usage.fiveHour, now)) 7d \(countdown(usage.sevenDay, now))"
     }
-
-    static func attributedTitle(_ usage: Usage, _ now: Date, font: NSFont, suffix: String = "") -> NSAttributedString {
-        func color(_ style: Style) -> NSColor? {
-            switch style {
-            case .plain: return nil
-            case .label: return .systemGray
-            case .limit: return .systemGreen
-            case .reset: return .systemYellow
-            case .bar: return nil
-            }
-        }
-        let result = NSMutableAttributedString()
-        for (text, style) in segments(usage, now) {
-            if case .bar(let fraction) = style {
-                let attachment = NSTextAttachment()
-                attachment.image = barImage(fraction)
-                attachment.bounds = CGRect(x: 0, y: -3, width: barSize.width, height: barSize.height)
-                result.append(NSAttributedString(attachment: attachment))
-                result.append(NSAttributedString(string: " ", attributes: [.font: font]))
-                continue
-            }
-            var attributes: [NSAttributedString.Key: Any] = [.font: font]
-            if let c = color(style) { attributes[.foregroundColor] = c }
-            result.append(NSAttributedString(string: text, attributes: attributes))
-        }
-        if !suffix.isEmpty { result.append(NSAttributedString(string: suffix, attributes: [.font: font])) }
-        return result
-    }
-
-    static let barSize = NSSize(width: 14, height: 14)
 
     static func fraction(_ window: Window) -> Double {
         min(max((window.utilization ?? 0) / 100, 0), 1)
-    }
-
-    // Plain-text fallback used by --print.
-    static func textBar(_ window: Window) -> String {
-        let filled = Int((fraction(window) * 8).rounded())
-        return "[" + String(repeating: "█", count: filled) + String(repeating: "░", count: 8 - filled) + "]"
-    }
-
-    static func barImage(_ fraction: Double) -> NSImage {
-        NSImage(size: barSize, flipped: false) { rect in
-            let lineWidth: CGFloat = 2.5
-            let inset = rect.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
-            let center = NSPoint(x: rect.midX, y: rect.midY)
-            let radius = inset.width / 2
-
-            let track = NSBezierPath(ovalIn: inset)
-            track.lineWidth = lineWidth
-            NSColor.systemGray.withAlphaComponent(0.35).setStroke()
-            track.stroke()
-
-            if fraction > 0 {
-                // Start at 12 o'clock and sweep clockwise.
-                let arc = NSBezierPath()
-                arc.appendArc(withCenter: center, radius: radius,
-                              startAngle: 90, endAngle: 90 - 360 * fraction, clockwise: true)
-                arc.lineWidth = lineWidth
-                arc.lineCapStyle = .round
-                NSColor.systemGreen.setStroke()
-                arc.stroke()
-            }
-            return true
-        }
     }
 
     static func percent(_ window: Window) -> String {
@@ -193,21 +119,450 @@ enum UsageFormatter {
     }
 }
 
+struct UsageSnapshot {
+    var usage: Usage?
+    var error: String?
+    var updated: Date?
+    var now = Date()
+}
+
+// MARK: Shared views
+
+enum Palette {
+    static let limit = Color(nsColor: .systemGreen)
+    static let reset = Color(nsColor: .systemYellow)
+    static let limitSymbol = "gauge.with.dots.needle.33percent"
+    static let resetSymbol = "clock.arrow.circlepath"
+}
+
+// A small label stacked above its value, like the system's own menu bar stats.
+struct StackedStat: View {
+    let label: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: -2) {
+            Text(label).font(.system(size: 8, weight: .semibold)).foregroundColor(.secondary)
+            Text(value).font(.system(size: 11, weight: .semibold).monospacedDigit()).foregroundColor(color)
+        }
+        .fixedSize()
+    }
+}
+
+// MARK: Menu bar title
+
+struct MenuBarView: View {
+    let snapshot: UsageSnapshot
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: Palette.limitSymbol)
+            if let usage = snapshot.usage {
+                StackedStat(label: "5h", value: UsageFormatter.percent(usage.fiveHour), color: Palette.limit)
+                StackedStat(label: "7d", value: UsageFormatter.percent(usage.sevenDay), color: Palette.limit)
+                Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 1, height: 14).padding(.horizontal, 2)
+                Image(systemName: Palette.resetSymbol)
+                StackedStat(label: "5h", value: UsageFormatter.countdown(usage.fiveHour, snapshot.now), color: Palette.reset)
+                StackedStat(label: "7d", value: UsageFormatter.countdown(usage.sevenDay, snapshot.now), color: Palette.reset)
+                if snapshot.error != nil {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                }
+            } else {
+                Text(snapshot.error ?? "…").font(.system(size: 12))
+            }
+        }
+        .font(.system(size: 12, weight: .medium))
+        .padding(.horizontal, 5)
+        .frame(maxHeight: .infinity)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+// Draws SwiftUI inside the status item button but lets clicks reach the button so its menu still opens.
+final class ClickThroughHostingView<Content: View>: NSHostingView<Content> {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+// MARK: Notch island
+
+struct IslandMetrics: Equatable {
+    var notch = CGSize(width: 0, height: 24)   // the hardware notch, or zero width on screens without one
+    var midX: CGFloat = 0                      // notch center in screen coordinates
+    var top: CGFloat = 0                       // top edge of the screen
+    static let wing: CGFloat = 34              // room for the icon beside the notch when collapsed
+    static let ear: CGFloat = 14               // widest top "ear" curve, outside the island body
+    static let margin: CGFloat = 30            // room for the shadow
+
+    init() {}
+
+    init(screen: NSScreen) {
+        let frame = screen.frame
+        if screen.safeAreaInsets.top > 0, let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
+            notch = CGSize(width: frame.width - left.width - right.width, height: screen.safeAreaInsets.top)
+            midX = frame.minX + left.width + notch.width / 2
+        } else {
+            // No notch: hang a stand-in island from the middle of the menu bar.
+            let menuBar = frame.maxY - screen.visibleFrame.maxY
+            notch = CGSize(width: 0, height: menuBar > 0 ? menuBar : 24)
+            midX = frame.midX
+        }
+        top = frame.maxY
+    }
+
+    var collapsed: CGSize { CGSize(width: notch.width + Self.wing * 2, height: notch.height) }
+    var expanded: CGSize { CGSize(width: max(notch.width + 290, 340), height: notch.height + 160) }
+    var panel: CGSize { CGSize(width: expanded.width + (Self.ear + Self.margin) * 2, height: expanded.height + Self.margin) }
+
+    func rect(expanded isExpanded: Bool) -> NSRect {
+        let size = isExpanded ? expanded : collapsed
+        return NSRect(x: midX - size.width / 2, y: top - size.height, width: size.width, height: size.height)
+    }
+}
+
+final class IslandModel: ObservableObject {
+    @Published var snapshot = UsageSnapshot()
+    @Published var expanded = false
+    @Published var metrics = IslandMetrics()
+    var onRefresh: () -> Void = {}
+    var onMenu: () -> Void = {}
+}
+
+// Notch outline: concave "ears" where it meets the top edge, rounded corners at the bottom.
+struct IslandShape: Shape {
+    var ear: CGFloat
+    var radius: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(ear, radius) }
+        set { ear = newValue.first; radius = newValue.second }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let r = min(radius, rect.height / 2)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addQuadCurve(to: CGPoint(x: rect.minX + ear, y: rect.minY + ear), control: CGPoint(x: rect.minX + ear, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + ear, y: rect.maxY - r))
+        path.addQuadCurve(to: CGPoint(x: rect.minX + ear + r, y: rect.maxY), control: CGPoint(x: rect.minX + ear, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX - ear - r, y: rect.maxY))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX - ear, y: rect.maxY - r), control: CGPoint(x: rect.maxX - ear, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX - ear, y: rect.minY + ear))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY), control: CGPoint(x: rect.maxX - ear, y: rect.minY))
+        path.closeSubpath()
+        return path
+    }
+}
+
+struct IslandView: View {
+    @ObservedObject var model: IslandModel
+
+    private var size: CGSize { model.expanded ? model.metrics.expanded : model.metrics.collapsed }
+    private var ear: CGFloat { model.expanded ? IslandMetrics.ear : 6 }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                if model.expanded {
+                    expandedHeader.transition(.opacity)
+                } else {
+                    collapsedHeader.transition(.opacity)
+                }
+            }
+            .frame(height: model.metrics.notch.height)
+            if model.expanded {
+                details.transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .top)))
+            }
+        }
+        .padding(.horizontal, model.expanded ? 18 : 12)
+        .frame(width: size.width, height: size.height, alignment: .top)
+        .clipped()
+        .background(
+            IslandShape(ear: ear, radius: model.expanded ? 28 : 10)
+                // Black at the top so it merges with the notch, fading slightly towards the bottom.
+                .fill(LinearGradient(colors: [.black, .black.opacity(0.82)], startPoint: .top, endPoint: .bottom))
+                .frame(width: size.width + ear * 2)
+                .shadow(color: .black.opacity(model.expanded ? 0.45 : 0), radius: 14, y: 6)
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .environment(\.colorScheme, .dark)
+        .animation(.spring(response: 0.42, dampingFraction: 0.8), value: model.expanded)
+    }
+
+    // Just the usage icon left of the notch (centered when there is none); it turns orange if a refresh failed.
+    private var collapsedHeader: some View {
+        let hasNotch = model.metrics.notch.width > 0
+        return HStack(spacing: 0) {
+            Image(systemName: Palette.limitSymbol)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(model.snapshot.error == nil ? .white.opacity(0.9) : .orange)
+            if hasNotch { Spacer(minLength: model.metrics.notch.width) }
+        }
+        .frame(maxWidth: .infinity, alignment: hasNotch ? .leading : .center)
+    }
+
+    private var expandedHeader: some View {
+        HStack(spacing: 6) {
+            Image(systemName: Palette.limitSymbol).foregroundColor(Palette.limit)
+            Text("Claude Usage").foregroundColor(.white)
+            Spacer(minLength: model.metrics.notch.width)
+            IslandButton(symbol: "arrow.clockwise", action: model.onRefresh)
+            IslandButton(symbol: "ellipsis", action: model.onMenu)
+        }
+        .font(.system(size: 12, weight: .semibold))
+    }
+
+    private var details: some View {
+        VStack(spacing: 12) {
+            if let usage = model.snapshot.usage {
+                UsageRow(title: "5-hour limit", window: usage.fiveHour, now: model.snapshot.now)
+                UsageRow(title: "7-day limit", window: usage.sevenDay, now: model.snapshot.now)
+            } else {
+                Text(model.snapshot.error ?? "Loading…")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.7))
+                    .frame(maxHeight: .infinity)
+            }
+            HStack(spacing: 4) {
+                if let updated = model.snapshot.updated {
+                    Text("Updated \(Text(updated, style: .time))")
+                }
+                if model.snapshot.usage != nil, let error = model.snapshot.error {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                    Text(error).lineLimit(1)
+                }
+                Spacer()
+            }
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(.white.opacity(0.45))
+        }
+        .padding(.top, 12)
+    }
+}
+
+struct UsageRow: View {
+    let title: String
+    let window: Window
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title).font(.system(size: 11, weight: .medium)).foregroundColor(.white.opacity(0.7))
+                Spacer()
+                Text(UsageFormatter.percent(window))
+                    .font(.system(size: 15, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundColor(Palette.limit)
+            }
+            ProgressCapsule(fraction: UsageFormatter.fraction(window))
+            HStack(spacing: 4) {
+                Image(systemName: Palette.resetSymbol)
+                Text("Resets in \(Text(UsageFormatter.countdown(window, now)).foregroundColor(Palette.reset))")
+            }
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(.white.opacity(0.5))
+        }
+    }
+}
+
+struct ProgressCapsule: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.12))
+                Capsule()
+                    .fill(LinearGradient(colors: [Palette.limit.opacity(0.7), Palette.limit], startPoint: .leading, endPoint: .trailing))
+                    .frame(width: fraction > 0 ? max(geo.size.width * fraction, 5) : 0)
+            }
+        }
+        .frame(height: 5)
+    }
+}
+
+struct IslandButton: View {
+    let symbol: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.white.opacity(0.85))
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(Color.white.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+final class IslandHostingView<Content: View>: NSHostingView<Content> {
+    var onRightClick: () -> Void = {}
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func rightMouseDown(with event: NSEvent) { onRightClick() }
+}
+
+final class IslandPanel: NSPanel {
+    init() {
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isMovable = false
+        ignoresMouseEvents = true
+        // Above the menu bar and its status items, below menus.
+        level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+    }
+
+    // Borderless windows are normally pushed below the menu bar; the island has to sit on top of it.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
+final class IslandController {
+    private let model = IslandModel()
+    private let panel = IslandPanel()
+    private var monitors: [Any] = []
+    private var exitTimer: Timer?
+    private var collapseWork: DispatchWorkItem?
+    private(set) var isShown = false
+
+    init(onRefresh: @escaping () -> Void, onMenu: @escaping () -> Void) {
+        model.onRefresh = onRefresh
+        model.onMenu = onMenu
+        let host = IslandHostingView(rootView: IslandView(model: model))
+        host.sizingOptions = []
+        host.onRightClick = onMenu
+        panel.contentView = host
+    }
+
+    func update(_ snapshot: UsageSnapshot) {
+        model.snapshot = snapshot
+    }
+
+    func setShown(_ shown: Bool) {
+        guard shown != isShown else { return }
+        isShown = shown
+        if shown {
+            layout()
+            panel.alphaValue = 0
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.25; panel.animator().alphaValue = 1 }
+            startTracking()
+        } else {
+            stopTracking()
+            setExpanded(false)
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.2; panel.animator().alphaValue = 0 }) { [weak self] in
+                guard let self, !self.isShown else { return }
+                self.panel.orderOut(nil)
+            }
+        }
+    }
+
+    // Prefer the screen with a notch; otherwise the one that holds the menu bar.
+    func layout() {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.screens.first else { return }
+        let metrics = IslandMetrics(screen: screen)
+        model.metrics = metrics
+        let size = metrics.panel
+        panel.setFrame(NSRect(x: metrics.midX - size.width / 2, y: metrics.top - size.height,
+                              width: size.width, height: size.height), display: true)
+    }
+
+    // Hover is tracked with event monitors because the panel ignores the mouse while collapsed,
+    // so the menu bar under its transparent area keeps working.
+    private func startTracking() {
+        let handler: (NSEvent) -> Void = { [weak self] _ in self?.mouseMoved() }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged], handler: handler) {
+            monitors.append(global)
+        }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved], handler: { handler($0); return $0 }) {
+            monitors.append(local)
+        }
+    }
+
+    private func stopTracking() {
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors.removeAll()
+    }
+
+    private func mouseMoved() {
+        let inside = model.metrics.rect(expanded: model.expanded).insetBy(dx: -4, dy: -4).contains(NSEvent.mouseLocation)
+        if inside {
+            collapseWork?.cancel()
+            collapseWork = nil
+            if !model.expanded { setExpanded(true) }
+        } else if model.expanded && collapseWork == nil {
+            let work = DispatchWorkItem { [weak self] in
+                self?.collapseWork = nil
+                self?.setExpanded(false)
+            }
+            collapseWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+        }
+    }
+
+    private func setExpanded(_ expanded: Bool) {
+        guard model.expanded != expanded else { return }
+        model.expanded = expanded
+        panel.ignoresMouseEvents = !expanded
+        exitTimer?.invalidate()
+        exitTimer = nil
+        if expanded {
+            // Mouse-moved events over our own non-key panel are not always delivered, so poll for the exit.
+            exitTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.mouseMoved() }
+        }
+    }
+}
+
+enum IslandMode: String, CaseIterable {
+    case automatic, always, never
+
+    var title: String {
+        switch self {
+        case .automatic: return "When Icons Would Be Hidden"
+        case .always: return "Always"
+        case .never: return "Never"
+        }
+    }
+}
+
+// MARK: App
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let client = UsageClient()
     private var timer: Timer?
+    private var islandTimer: Timer?
+    private var titleWidth: CGFloat = 0
     private var lastUsage: Usage?
     private var lastUpdated: Date?
     private var lastError: String?
 
+    private let menu = NSMenu()
     private let updatedItem = NSMenuItem(title: "Not updated yet", action: nil, keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+    private let islandMenu = NSMenu()
+    private let titleView = ClickThroughHostingView(rootView: MenuBarView(snapshot: UsageSnapshot()))
+    private lazy var island = IslandController(
+        onRefresh: { [weak self] in self?.refresh() },
+        onMenu: { [weak self] in self?.menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) })
+    private var islandCheck: DispatchWorkItem?
+
+    private var islandMode: IslandMode {
+        get { IslandMode(rawValue: UserDefaults.standard.string(forKey: "islandMode") ?? "") ?? .automatic }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "islandMode") }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem.button?.font = Self.titleFont
-        statusItem.button?.title = "Limit: …"
+        if let button = statusItem.button {
+            titleView.autoresizingMask = [.height]
+            button.addSubview(titleView)
+        }
         buildMenu()
+        render()
+        updateIsland()
         refresh()
 
         // Poll the API every minute; re-render every 30s so the countdowns stay current in between.
@@ -217,10 +572,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(refresh),
             name: NSWorkspace.didWakeNotification, object: nil)
+
+        // Other apps add and remove menu bar icons without telling anyone, so re-check the space regularly
+        // as well as on the events that usually change it.
+        islandTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.updateIsland()
+        }
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(windowChanged(_:)), name: NSWindow.didMoveNotification, object: nil)
+        center.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(scheduleIslandCheck),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
     }
 
     private func buildMenu() {
-        let menu = NSMenu()
         updatedItem.isEnabled = false
         menu.addItem(updatedItem)
         menu.addItem(.separator())
@@ -229,11 +595,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(refreshItem)
         loginItem.target = self
         menu.addItem(loginItem)
+        for mode in IslandMode.allCases {
+            let item = NSMenuItem(title: mode.title, action: #selector(selectIslandMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode.rawValue
+            islandMenu.addItem(item)
+        }
+        let islandItem = NSMenuItem(title: "Show in Notch", action: nil, keyEquivalent: "")
+        islandItem.submenu = islandMenu
+        menu.addItem(islandItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         menu.delegate = self
         statusItem.menu = menu
         updateLoginItemState()
+        updateIslandMenuState()
     }
 
     private func tick() {
@@ -261,25 +637,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func render() {
-        guard let usage = lastUsage else {
-            statusItem.button?.title = "Limit: \(lastError ?? "…")"
-            return
-        }
-        statusItem.button?.attributedTitle = UsageFormatter.attributedTitle(
-            usage, Date(), font: Self.titleFont, suffix: lastError == nil ? "" : " ⚠︎")
+        let snapshot = UsageSnapshot(usage: lastUsage, error: lastError, updated: lastUpdated)
+        titleView.rootView = MenuBarView(snapshot: snapshot)
+        titleWidth = ceil(titleView.fittingSize.width)
+        statusItem.length = titleWidth
+        titleView.frame = NSRect(x: 0, y: 0, width: titleWidth,
+                                 height: statusItem.button?.bounds.height ?? NSStatusBar.system.thickness)
+        island.update(snapshot)
 
         var status = lastUpdated.map { "Updated " + Self.timeFormatter.string(from: $0) } ?? "Not updated yet"
         if let error = lastError { status += " — \(error)" }
         updatedItem.title = status
+        scheduleIslandCheck()
     }
-
-    private static let titleFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.timeStyle = .medium
         return f
     }()
+
+    // MARK: Notch island
+
+    @objc private func windowChanged(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === statusItem.button?.window else { return }
+        scheduleIslandCheck()
+    }
+
+    @objc private func screensChanged() {
+        if island.isShown { island.layout() }
+        scheduleIslandCheck()
+    }
+
+    // Debounced, because the menu bar shuffles items around briefly while apps launch and switch.
+    @objc private func scheduleIslandCheck() {
+        islandCheck?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.updateIsland() }
+        islandCheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    // The stats live in exactly one place: the menu bar item or the island.
+    private func updateIsland() {
+        let showIsland: Bool
+        switch islandMode {
+        case .always: showIsland = true
+        case .never: showIsland = false
+        case .automatic: showIsland = statsWouldHideIcons()
+        }
+        if statusItem.isVisible == showIsland { statusItem.isVisible = !showIsland }
+        island.setShown(showIsland)
+    }
+
+    // Whether the stats plus every other menu bar icon are wider than the space right of the notch,
+    // so macOS would have to hide some icons behind it. Icons macOS has hidden are still in the window
+    // list, so the total is the same whether or not our own item is currently in the menu bar.
+    private func statsWouldHideIcons() -> Bool {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 }),
+              let space = screen.auxiliaryTopRightArea?.width,
+              let primary = NSScreen.screens.first else { return false }
+        // The window list uses top-left origin coordinates.
+        func flipped(_ rect: CGRect) -> CGRect {
+            CGRect(x: rect.minX, y: primary.frame.maxY - rect.maxY, width: rect.width, height: rect.height)
+        }
+        let menuBar = flipped(CGRect(x: screen.frame.minX, y: screen.frame.maxY - screen.safeAreaInsets.top,
+                                     width: screen.frame.width, height: screen.safeAreaInsets.top))
+        let own = statusItem.isVisible ? statusItem.button?.window : nil
+        let ownFrame = own.map { flipped($0.frame) }
+
+        let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        var others: CGFloat = 0
+        for info in windows where info[kCGWindowLayer as String] as? Int == Int(CGWindowLevelForKey(.statusWindow)) {
+            guard let dict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dict),
+                  bounds.height <= menuBar.height + 2,
+                  menuBar.contains(CGPoint(x: bounds.midX, y: bounds.midY)) else { continue }
+            if let own, info[kCGWindowNumber as String] as? Int == own.windowNumber { continue }
+            if let ownFrame, abs(bounds.minX - ownFrame.minX) < 2, abs(bounds.width - ownFrame.width) < 2 { continue }
+            others += bounds.width
+        }
+        // A little slack once the island is up, so a few points of change don't bounce the stats back and forth.
+        let slack: CGFloat = island.isShown ? 8 : 0
+        return others + titleWidth > space - slack
+    }
+
+    @objc private func selectIslandMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let mode = IslandMode(rawValue: raw) else { return }
+        islandMode = mode
+        updateIslandMenuState()
+        updateIsland()
+    }
+
+    private func updateIslandMenuState() {
+        for item in islandMenu.items {
+            item.state = (item.representedObject as? String) == islandMode.rawValue ? .on : .off
+        }
+    }
 
     // MARK: Launch at login
 

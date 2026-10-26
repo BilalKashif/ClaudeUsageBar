@@ -6,8 +6,14 @@ A small macOS menu bar app that shows your current Claude usage limits and when 
 
 The title shows, from left to right:
 
-- **Limit**: the 5 hour and 7 day usage as a ring and a percentage.
-- **Reset on**: the time left until each limit resets.
+- **Limit** (gauge icon): the 5 hour and 7 day usage as a percentage.
+- **Reset on** (clock icon): the time left until each limit resets.
+
+Each value has a small `5h` or `7d` label above it, like the system's own menu bar stats.
+
+On a Mac with a notch, if showing the stats would push other menu bar icons behind the notch, the stats leave the menu bar and move into a black island around the notch, so all your other icons stay visible. Hover over the island and it expands with progress bars, reset times and buttons to refresh or open the menu.
+
+![The expanded notch island](docs/island.png)
 
 The app reads the login that Claude Code already stores on your Mac, so there is nothing to configure.
 
@@ -59,9 +65,19 @@ Click the menu bar item to open the menu:
 | Updated at ... | Time of the last successful refresh, plus the error if one occurred |
 | Refresh Now | Fetch usage immediately (Cmd+R) |
 | Launch at Login | Toggle automatic start at login |
+| Show in Notch | Where the stats appear: **When Icons Would Be Hidden** (default) uses the island only when the menu bar has no room for them, **Always** uses the island, **Never** uses the menu bar. The stats are shown in one place at a time. |
 | Quit | Close the app (Cmd+Q) |
 
 Usage is fetched every 60 seconds and again after the Mac wakes from sleep. The reset countdowns update every 30 seconds.
+
+### Notch island
+
+- **Collapsed**: only the usage icon shows, just left of the notch. It turns orange when the latest refresh failed.
+- **Expanded**: hover over the island to open it. It shows a progress bar and reset countdown for each limit, the last update time, a refresh button and a button that opens the app menu. Right-clicking the island also opens the menu. Move the pointer away to close it.
+
+While the stats are in the island there is no menu bar item, so open the menu with the island's `⋯` button or by right-clicking the island.
+
+The space check runs every few seconds, so the stats move back to the menu bar soon after other icons are removed. With **When Icons Would Be Hidden**, the island is only used on Macs with a notch. With **Always**, Macs without a notch get an island hanging from the middle of the menu bar.
 
 Countdown format: under one day it shows hours and minutes (`4h 22m`), otherwise days and hours (`2d 5h`).
 
@@ -72,7 +88,7 @@ Countdown format: under one day it shows hours and minutes (`4h 22m`), otherwise
 | `Limit: Not logged in to Claude Code` | No Claude Code login was found in the Keychain or in `~/.claude/.credentials.json`. Log in with Claude Code. |
 | `Limit: Login expired - open Claude Code` | The stored token was rejected. Open Claude Code once so it refreshes the login. |
 | `Limit: Offline` | The usage request failed. The app retries on the next refresh. |
-| A warning sign after the numbers | The latest refresh failed, so the numbers shown are from the previous successful one. |
+| A warning sign after the numbers (an orange icon in the island) | The latest refresh failed, so the numbers shown are from the previous successful one. |
 
 ### Command line check
 
@@ -85,14 +101,15 @@ To print the title text to the terminal without starting the menu bar app:
 Example output:
 
 ```
-Limit: 5h [░░░░░░░░] 4% 7d [█░░░░░░░] 18%  |  Reset on: 5h 4h 22m 7d 2d 5h
+Limit: 5h 4% 7d 18%  |  Reset on: 5h 4h 22m 7d 2d 5h
 ```
 
 ## How it works
 
 1. The OAuth access token is read from the Keychain item "Claude Code-credentials" (or `~/.claude/.credentials.json` as a fallback).
 2. The app calls `https://api.anthropic.com/api/oauth/usage` and reads the `five_hour` and `seven_day` utilization and reset times.
-3. The result is drawn into the menu bar title using colored text and small ring images.
+3. The result is drawn into the menu bar title with SwiftUI.
+4. The app adds up the widths of all menu bar icons on the notched screen, including ones macOS has hidden behind the notch. If they plus the stats don't fit right of the notch, the stats are shown in the notch island instead of the menu bar.
 
 The token is only sent to `api.anthropic.com`. It is not stored or logged by this app.
 
