@@ -68,13 +68,13 @@ Click the menu bar item to open the menu. While the stats are in the notch islan
 | Show in Notch | Where the stats appear: **When Icons Would Be Hidden** (default) uses the island only when the menu bar has no room for them, **Always** uses the island, **Never** uses the menu bar. The stats are shown in one place at a time. |
 | Quit | Close the app (Cmd+Q) |
 
-Usage is fetched every 5 minutes, and after the Mac or its displays wake if a fetch is due. The reset countdowns update every 30 seconds in between, and once a limit's reset time passes it shows `0%` without waiting for the next fetch.
+Usage is fetched every 5 minutes, and after the Mac or its displays wake if a fetch is due. The reset countdowns are redrawn every minute in between without sending a request, and once a limit's reset time passes it shows `0%` without waiting for the next fetch.
 
 The usage endpoint is rate limited per account, and Claude Code uses the same allowance, so the app is careful with requests:
 
 - Only one request is in flight at a time.
 - If the server answers `429 Too Many Requests`, the app waits for the time in its `Retry-After` header, or 5 minutes if there is none. The wait doubles after each further `429`, up to 30 minutes.
-- Other failures, such as no network, are retried after 30 seconds, then 1, 2 and 4 minutes, and then every 5 minutes.
+- Other failures, such as no network, are retried after 1 minute, then 2 and 4 minutes, and then every 5 minutes.
 - No requests are sent while the displays are asleep.
 - The last numbers and any rate-limit wait are saved, so quitting and reopening the app shows the numbers straight away and does not send a request early.
 
@@ -91,14 +91,14 @@ Countdown format: under one day it shows hours and minutes (`4h 22m`), otherwise
 
 ### Status messages
 
-These appear next to the gauge icon in the menu bar, or in the expanded island, until the first successful refresh.
+The login messages replace the stats until the first successful refresh. For any other problem the stats stay in place, showing `–` until there are numbers to show.
 
 | Message | Meaning |
 | --- | --- |
 | `Not logged in to Claude Code` | No Claude Code login was found in the Keychain or in `~/.claude/.credentials.json`. Log in with Claude Code. |
 | `Login expired — open Claude Code` | The stored token was rejected. Open Claude Code once so it refreshes the login. |
-| `Offline` | The usage request failed. The app retries shortly. |
-| `Rate limited` | The server asked the app to slow down. The menu and the expanded island show when it will try again. |
+| `Offline` (in the menu and expanded island) | The usage request failed. The app retries shortly. |
+| `Rate limited` (in the menu and expanded island) | The server asked the app to slow down. The menu and the expanded island show when it will try again. |
 | A warning sign after the numbers (or in the expanded island's footer) | The numbers are more than 15 minutes old because refreshes keep failing, or the login needs attention. A single failed refresh while the numbers are still recent only shows a note in the menu and the expanded island. |
 
 ### Command line check

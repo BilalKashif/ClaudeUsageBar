@@ -69,7 +69,7 @@ enum RefreshPolicy {
         case .rateLimited(let retryAfter):
             base = max(retryAfter ?? 0, min(interval * doubling, maxBackoff))
         case .http, .badResponse, .offline:
-            base = min(30 * doubling, interval)
+            base = min(60 * doubling, interval)
         }
         // A little jitter so retries don't line up with other clients using the same account.
         return base * Double.random(in: 1...1.1)
@@ -162,17 +162,19 @@ enum UsageFormatter {
             + "  |  Reset on: 5h \(countdown(usage.fiveHour, now)) 7d \(countdown(usage.sevenDay, now))"
     }
 
-    static func fraction(_ window: Window) -> Double {
-        min(max((window.utilization ?? 0) / 100, 0), 1)
+    // A nil window means there are no numbers yet; a window with a nil value means the API reported none.
+    static func fraction(_ window: Window?) -> Double {
+        min(max((window?.utilization ?? 0) / 100, 0), 1)
     }
 
-    static func percent(_ window: Window) -> String {
+    static func percent(_ window: Window?) -> String {
+        guard let window else { return "–" }
         guard let value = window.utilization else { return "0%" }
         return "\(Int(value.rounded()))%"
     }
 
-    static func countdown(_ window: Window, _ now: Date) -> String {
-        guard let reset = window.resetsAt else { return "–" }
+    static func countdown(_ window: Window?, _ now: Date) -> String {
+        guard let reset = window?.resetsAt else { return "–" }
         let minutes = max(0, Int(reset.timeIntervalSince(now) / 60))
         let days = minutes / 1440
         let hours = (minutes % 1440) / 60
@@ -189,6 +191,7 @@ struct UsageSnapshot {
     var usage: Usage?
     var error: String?      // shown with a warning sign: the numbers are old or the user must act
     var notice: String?     // shown quietly: a retry is pending but the numbers are still recent
+    var blocker: String?    // replaces the stats: there are no numbers and the user has to act (e.g. log in)
     var updated: Date?
     var now = Date()
 }
@@ -225,18 +228,21 @@ struct MenuBarView: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: Palette.limitSymbol)
-            if let usage = snapshot.usage {
-                StackedStat(label: "5h", value: UsageFormatter.percent(usage.fiveHour), color: Palette.limit)
-                StackedStat(label: "7d", value: UsageFormatter.percent(usage.sevenDay), color: Palette.limit)
+            if let blocker = snapshot.blocker {
+                Text(blocker).font(.system(size: 12))
+            } else {
+                // Before the first successful fetch (or while rate limited without saved numbers) the
+                // layout stays put with placeholders, so the item doesn't collapse into a message.
+                let usage = snapshot.usage
+                StackedStat(label: "5h", value: UsageFormatter.percent(usage?.fiveHour), color: Palette.limit)
+                StackedStat(label: "7d", value: UsageFormatter.percent(usage?.sevenDay), color: Palette.limit)
                 Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 1, height: 14).padding(.horizontal, 2)
                 Image(systemName: Palette.resetSymbol)
-                StackedStat(label: "5h", value: UsageFormatter.countdown(usage.fiveHour, snapshot.now), color: Palette.reset)
-                StackedStat(label: "7d", value: UsageFormatter.countdown(usage.sevenDay, snapshot.now), color: Palette.reset)
+                StackedStat(label: "5h", value: UsageFormatter.countdown(usage?.fiveHour, snapshot.now), color: Palette.reset)
+                StackedStat(label: "7d", value: UsageFormatter.countdown(usage?.sevenDay, snapshot.now), color: Palette.reset)
                 if snapshot.error != nil {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
                 }
-            } else {
-                Text(snapshot.error ?? "…").font(.system(size: 12))
             }
         }
         .font(.system(size: 12, weight: .medium))
@@ -363,11 +369,11 @@ struct IslandView: View {
 
     private var details: some View {
         VStack(spacing: 12) {
-            if let usage = model.snapshot.usage {
-                UsageRow(title: "5-hour limit", window: usage.fiveHour, now: model.snapshot.now)
-                UsageRow(title: "7-day limit", window: usage.sevenDay, now: model.snapshot.now)
+            if model.snapshot.blocker == nil {
+                UsageRow(title: "5-hour limit", window: model.snapshot.usage?.fiveHour, now: model.snapshot.now)
+                UsageRow(title: "7-day limit", window: model.snapshot.usage?.sevenDay, now: model.snapshot.now)
             } else {
-                Text(model.snapshot.error ?? "Loading…")
+                Text(model.snapshot.blocker ?? "")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(.white.opacity(0.7))
                     .frame(maxHeight: .infinity)
@@ -376,7 +382,7 @@ struct IslandView: View {
                 if let updated = model.snapshot.updated {
                     Text("Updated \(Text(updated, style: .time))")
                 }
-                if model.snapshot.usage != nil, let error = model.snapshot.error {
+                if model.snapshot.blocker == nil, let error = model.snapshot.error {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
                     Text(error).lineLimit(1)
                 } else if let notice = model.snapshot.notice {
@@ -393,7 +399,7 @@ struct IslandView: View {
 
 struct UsageRow: View {
     let title: String
-    let window: Window
+    let window: Window?
     let now: Date
 
     var body: some View {
@@ -633,8 +639,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateIsland()
         fetchIfDue()
 
-        // Re-render every 30s so the countdowns stay current, and send a request whenever one is due.
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        // Once a minute: redraw so the countdowns stay current (no request), and send a request if one is due.
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.tick()
         }
         timer?.tolerance = 5
@@ -782,9 +788,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stale = lastUpdated.map { now.timeIntervalSince($0) > RefreshPolicy.staleAfter } ?? true
         let retry = lastError.map { "\($0.message), next try \(Self.shortTimeFormatter.string(from: max(nextFetch, now)))" }
         let warn = lastError.map { $0.needsAction || stale } ?? false
+        let blocker = lastUsage == nil && lastError?.needsAction == true ? lastError?.message : nil
         snapshot = UsageSnapshot(usage: lastUsage?.current(at: now),
-                                 error: warn ? (lastUsage == nil ? lastError?.message : retry) : nil,
+                                 error: warn ? retry : nil,
                                  notice: warn ? nil : retry,
+                                 blocker: blocker,
                                  updated: lastUpdated, now: now)
         titleView.rootView = MenuBarView(snapshot: snapshot)
         titleWidth = ceil(titleView.fittingSize.width)
