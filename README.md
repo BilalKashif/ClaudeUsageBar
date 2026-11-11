@@ -62,13 +62,21 @@ Click the menu bar item to open the menu. While the stats are in the notch islan
 
 | Item | Description |
 | --- | --- |
-| Updated at ... | Time of the last successful refresh, plus the error if one occurred |
-| Refresh Now | Fetch usage immediately (Cmd+R) |
+| Updated at ... | Time of the last successful refresh, plus the error and the time of the next try if the last request failed |
+| Refresh Now | Fetch usage immediately (Cmd+R). It does nothing within 15 seconds of the last request, or while the app is waiting out a rate limit. |
 | Launch at Login | Toggle automatic start at login |
 | Show in Notch | Where the stats appear: **When Icons Would Be Hidden** (default) uses the island only when the menu bar has no room for them, **Always** uses the island, **Never** uses the menu bar. The stats are shown in one place at a time. |
 | Quit | Close the app (Cmd+Q) |
 
-Usage is fetched every 60 seconds and again after the Mac wakes from sleep. The reset countdowns update every 30 seconds.
+Usage is fetched every 5 minutes, and after the Mac or its displays wake if a fetch is due. The reset countdowns update every 30 seconds in between, and once a limit's reset time passes it shows `0%` without waiting for the next fetch.
+
+The usage endpoint is rate limited per account, and Claude Code uses the same allowance, so the app is careful with requests:
+
+- Only one request is in flight at a time.
+- If the server answers `429 Too Many Requests`, the app waits for the time in its `Retry-After` header, or 5 minutes if there is none. The wait doubles after each further `429`, up to 30 minutes.
+- Other failures, such as no network, are retried after 30 seconds, then 1, 2 and 4 minutes, and then every 5 minutes.
+- No requests are sent while the displays are asleep.
+- The last numbers and any rate-limit wait are saved, so quitting and reopening the app shows the numbers straight away and does not send a request early.
 
 ### Notch island
 
@@ -89,8 +97,9 @@ These appear next to the gauge icon in the menu bar, or in the expanded island, 
 | --- | --- |
 | `Not logged in to Claude Code` | No Claude Code login was found in the Keychain or in `~/.claude/.credentials.json`. Log in with Claude Code. |
 | `Login expired — open Claude Code` | The stored token was rejected. Open Claude Code once so it refreshes the login. |
-| `Offline` | The usage request failed. The app retries on the next refresh. |
-| A warning sign after the numbers (or in the expanded island's footer) | The latest refresh failed, so the numbers shown are from the previous successful one. |
+| `Offline` | The usage request failed. The app retries shortly. |
+| `Rate limited` | The server asked the app to slow down. The menu and the expanded island show when it will try again. |
+| A warning sign after the numbers (or in the expanded island's footer) | The numbers are more than 15 minutes old because refreshes keep failing, or the login needs attention. A single failed refresh while the numbers are still recent only shows a note in the menu and the expanded island. |
 
 ### Command line check
 
@@ -126,7 +135,7 @@ Everything lives in `main.swift`.
 - Island sizes: `IslandMetrics` (expanded size, stand-in notch width)
 - Island look and animation: `IslandView` (gradient, corner radii, spring) and `IslandShape` (outline)
 - When the island is used: `statsWouldHideIcons` in `AppDelegate`
-- Refresh interval: the timer in `applicationDidFinishLaunching`
+- Refresh interval, backoff and when the warning appears: `RefreshPolicy`
 
 After editing, run `./build.sh` again and relaunch the app.
 

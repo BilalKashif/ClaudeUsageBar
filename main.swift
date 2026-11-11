@@ -6,21 +6,74 @@ import SwiftUI
 // Reads the Claude Code login from the macOS Keychain and polls Anthropic's OAuth usage endpoint.
 // When the menu bar has no room for the item, the stats move into an island at the top of every display.
 
-struct Window {
+struct Window: Codable {
     let utilization: Double?
     let resetsAt: Date?
+
+    // Once the reset time has passed the window starts over, so the last fetched number no longer applies.
+    func current(at now: Date) -> Window {
+        guard let resetsAt, resetsAt <= now else { return self }
+        return Window(utilization: 0, resetsAt: nil)
+    }
 }
 
-struct Usage {
+struct Usage: Codable {
     let fiveHour: Window
     let sevenDay: Window
+
+    func current(at now: Date) -> Usage {
+        Usage(fiveHour: fiveHour.current(at: now), sevenDay: sevenDay.current(at: now))
+    }
 }
 
-enum UsageError: Error {
+enum UsageError: Error, Equatable {
     case noCredentials
     case unauthorized
+    case rateLimited(retryAfter: TimeInterval?)
     case http(Int)
     case badResponse
+    case offline
+
+    // Errors the user has to fix, as opposed to ones that go away by waiting.
+    var needsAction: Bool { self == .noCredentials || self == .unauthorized }
+
+    var message: String {
+        switch self {
+        case .noCredentials: return "Not logged in to Claude Code"
+        case .unauthorized: return "Login expired — open Claude Code"
+        case .rateLimited: return "Rate limited"
+        case .http(let code): return "HTTP \(code)"
+        case .badResponse: return "Unexpected response"
+        case .offline: return "Offline"
+        }
+    }
+}
+
+// The usage endpoint is rate limited per account, and Claude Code draws on the same allowance,
+// so poll gently, never overlap requests, and back off hard when the server says so.
+enum RefreshPolicy {
+    static let interval: TimeInterval = 5 * 60       // normal polling; the countdowns tick locally in between
+    static let manualGap: TimeInterval = 15          // Refresh Now does nothing this soon after the last request
+    static let maxBackoff: TimeInterval = 30 * 60    // longest wait we choose ourselves (Retry-After can be longer)
+    static let maxHold: TimeInterval = 2 * 60 * 60   // never trust a saved hold further out than this
+    static let staleAfter: TimeInterval = 15 * 60    // only show the warning once the numbers are this old
+    static let wakeDelay: TimeInterval = 5           // give the network a moment after sleep
+
+    // Seconds until the next request, given how the last one went and how many in a row have failed.
+    static func delay(after error: UsageError?, failures: Int) -> TimeInterval {
+        let doubling = pow(2, Double(max(failures - 1, 0)))
+        let base: TimeInterval
+        switch error {
+        case nil, .noCredentials, .unauthorized:
+            base = interval
+        case .rateLimited(let retryAfter):
+            base = max(retryAfter ?? 0, min(interval * doubling, maxBackoff))
+        case .http, .badResponse, .offline:
+            base = min(30 * doubling, interval)
+        }
+        // A little jitter so retries don't line up with other clients using the same account.
+        return base * Double.random(in: 1...1.1)
+    }
 }
 
 final class UsageClient {
@@ -36,11 +89,24 @@ final class UsageClient {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw UsageError.badResponse }
         if http.statusCode == 401 || http.statusCode == 403 { throw UsageError.unauthorized }
+        if http.statusCode == 429 { throw UsageError.rateLimited(retryAfter: Self.retryAfter(http)) }
         guard http.statusCode == 200 else { throw UsageError.http(http.statusCode) }
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw UsageError.badResponse
         }
         return Usage(fiveHour: Self.window(json["five_hour"]), sevenDay: Self.window(json["seven_day"]))
+    }
+
+    // Retry-After is either a number of seconds or an HTTP date.
+    private static func retryAfter(_ response: HTTPURLResponse) -> TimeInterval? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespaces) else { return nil }
+        if let seconds = TimeInterval(value) { return max(0, seconds) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter.date(from: value).map { max(0, $0.timeIntervalSinceNow) }
     }
 
     private static func window(_ value: Any?) -> Window {
@@ -121,7 +187,8 @@ enum UsageFormatter {
 
 struct UsageSnapshot {
     var usage: Usage?
-    var error: String?
+    var error: String?      // shown with a warning sign: the numbers are old or the user must act
+    var notice: String?     // shown quietly: a retry is pending but the numbers are still recent
     var updated: Date?
     var now = Date()
 }
@@ -312,6 +379,8 @@ struct IslandView: View {
                 if model.snapshot.usage != nil, let error = model.snapshot.error {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
                     Text(error).lineLimit(1)
+                } else if let notice = model.snapshot.notice {
+                    Text("· \(notice)").lineLimit(1)
                 }
                 Spacer()
             }
@@ -529,7 +598,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var titleWidth: CGFloat = 0
     private var lastUsage: Usage?
     private var lastUpdated: Date?
-    private var lastError: String?
+    private var lastError: UsageError?
+
+    // Request scheduling: at most one request in flight, and none before `nextFetch`.
+    private var isFetching = false
+    private var nextFetch = Date()
+    private var lastAttempt: Date?
+    private var failures = 0
+    private var screensAsleep = false
 
     private let menu = NSMenu()
     private let updatedItem = NSMenuItem(title: "Not updated yet", action: nil, keyEquivalent: "")
@@ -552,17 +628,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         buildMenu()
         makeIslands()
+        restoreState()
         render()
         updateIsland()
-        refresh()
+        fetchIfDue()
 
-        // Poll the API every minute; re-render every 30s so the countdowns stay current in between.
+        // Re-render every 30s so the countdowns stay current, and send a request whenever one is due.
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.tick()
         }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(refresh),
-            name: NSWorkspace.didWakeNotification, object: nil)
+        timer?.tolerance = 5
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(didWake), name: NSWorkspace.screensDidWakeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(screensDidSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
 
         // Other apps add and remove menu bar icons without telling anyone, so re-check the space regularly
         // as well as on the events that usually change it.
@@ -581,7 +660,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updatedItem.isEnabled = false
         menu.addItem(updatedItem)
         menu.addItem(.separator())
-        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
         loginItem.target = self
@@ -603,32 +682,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateIslandMenuState()
     }
 
+    // MARK: Fetching
+
     private func tick() {
-        let stale = lastUpdated.map { Date().timeIntervalSince($0) >= 60 } ?? true
-        if stale { refresh() } else { render() }
+        fetchIfDue()
+        render()
     }
 
-    @objc private func refresh() {
+    private func fetchIfDue() {
+        guard !screensAsleep, Date() >= nextFetch else { return }
+        fetch()
+    }
+
+    // Refresh Now and the island's refresh button. A refresh can't skip a rate-limit wait (the menu
+    // shows when the next try is) and does nothing right after another request.
+    @objc private func refreshNow() {
+        let now = Date()
+        if case .rateLimited = lastError, nextFetch > now { render(); return }
+        if let lastAttempt, now.timeIntervalSince(lastAttempt) < RefreshPolicy.manualGap { return }
+        fetch()
+    }
+
+    private func fetch() {
+        guard !isFetching else { return }
+        isFetching = true
+        lastAttempt = Date()
         Task { @MainActor in
             do {
                 lastUsage = try await client.fetch()
                 lastUpdated = Date()
                 lastError = nil
-            } catch UsageError.noCredentials {
-                lastError = "Not logged in to Claude Code"
-            } catch UsageError.unauthorized {
-                lastError = "Login expired — open Claude Code"
-            } catch UsageError.http(let code) {
-                lastError = "HTTP \(code)"
+                failures = 0
             } catch {
-                lastError = "Offline"
+                lastError = error as? UsageError ?? .offline
+                failures += 1
             }
+            nextFetch = Date().addingTimeInterval(RefreshPolicy.delay(after: lastError, failures: failures))
+            isFetching = false
+            saveState()
             render()
         }
     }
 
+    @objc private func didWake() {
+        screensAsleep = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + RefreshPolicy.wakeDelay) { [weak self] in
+            self?.fetchIfDue()
+            self?.render()
+        }
+    }
+
+    // Nobody can see the numbers while the displays are off, so don't spend requests on them.
+    @objc private func screensDidSleep() {
+        screensAsleep = true
+    }
+
+    // MARK: Saved state
+
+    // Kept across launches so a relaunch shows the last numbers at once, and doesn't send a request
+    // that the server just asked us to hold off on.
+    private struct SavedState: Codable {
+        var usage: Usage?
+        var updated: Date?
+        var nextFetch: Date
+        var rateLimited: Bool
+    }
+
+    private static let savedStateKey = "savedState"
+
+    private func saveState() {
+        var rateLimited = false
+        if case .rateLimited = lastError { rateLimited = true }
+        let state = SavedState(usage: lastUsage, updated: lastUpdated, nextFetch: nextFetch, rateLimited: rateLimited)
+        if let data = try? JSONEncoder().encode(state) {
+            UserDefaults.standard.set(data, forKey: Self.savedStateKey)
+        }
+    }
+
+    private func restoreState() {
+        guard let data = UserDefaults.standard.data(forKey: Self.savedStateKey),
+              let state = try? JSONDecoder().decode(SavedState.self, from: data) else { return }
+        let now = Date()
+        lastUsage = state.usage
+        lastUpdated = state.updated
+        if state.rateLimited {
+            lastError = .rateLimited(retryAfter: nil)
+            nextFetch = min(state.nextFetch, now.addingTimeInterval(RefreshPolicy.maxHold))
+        } else if let updated = state.updated, state.usage != nil {
+            nextFetch = min(updated.addingTimeInterval(RefreshPolicy.interval), now.addingTimeInterval(RefreshPolicy.interval))
+        }
+    }
+
+    // MARK: Rendering
+
     private func render() {
-        snapshot = UsageSnapshot(usage: lastUsage, error: lastError, updated: lastUpdated)
+        let now = Date()
+        // Transient errors with recent numbers only get a quiet note; the warning sign is for numbers that
+        // have gone stale and for problems the user has to fix.
+        let stale = lastUpdated.map { now.timeIntervalSince($0) > RefreshPolicy.staleAfter } ?? true
+        let retry = lastError.map { "\($0.message), next try \(Self.shortTimeFormatter.string(from: max(nextFetch, now)))" }
+        let warn = lastError.map { $0.needsAction || stale } ?? false
+        snapshot = UsageSnapshot(usage: lastUsage?.current(at: now),
+                                 error: warn ? (lastUsage == nil ? lastError?.message : retry) : nil,
+                                 notice: warn ? nil : retry,
+                                 updated: lastUpdated, now: now)
         titleView.rootView = MenuBarView(snapshot: snapshot)
         titleWidth = ceil(titleView.fittingSize.width)
         statusItem.length = titleWidth
@@ -637,7 +794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         islands.forEach { $0.update(snapshot) }
 
         var status = lastUpdated.map { "Updated " + Self.timeFormatter.string(from: $0) } ?? "Not updated yet"
-        if let error = lastError { status += " — \(error)" }
+        if let retry { status += " — \(retry)" }
         updatedItem.title = status
         scheduleIslandCheck()
     }
@@ -645,6 +802,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.timeStyle = .medium
+        return f
+    }()
+
+    private static let shortTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
         return f
     }()
 
@@ -667,7 +830,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         islands = NSScreen.screens.map { screen in
             let island = IslandController(
                 screen: screen,
-                onRefresh: { [weak self] in self?.refresh() },
+                onRefresh: { [weak self] in self?.refreshNow() },
                 onMenu: { [weak self] in self?.menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) })
             island.update(snapshot)
             return island
