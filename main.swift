@@ -156,6 +156,29 @@ final class UsageClient {
     }
 }
 
+// Claude Code hands the same limits to its status line command on every update. A status line script
+// can save them to ~/.claude/rate-limits.json, as
+//   {"five_hour": {"used_percentage": 27, "resets_at": <unix seconds>}, "seven_day": {...}, "updated_at": <unix seconds>}
+// and the app then uses that file as a second source: it saves requests while Claude Code is in use,
+// and keeps numbers on screen when the usage endpoint is rate limiting us.
+enum LocalUsage {
+    static let path = NSHomeDirectory() + "/.claude/rate-limits.json"
+
+    static func read() -> (usage: Usage, updated: Date)? {
+        guard let data = FileManager.default.contents(atPath: path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["five_hour"] is [String: Any] || json["seven_day"] is [String: Any],
+              let updatedAt = (json["updated_at"] as? NSNumber)?.doubleValue else { return nil }
+        func window(_ value: Any?) -> Window {
+            let dict = value as? [String: Any]
+            return Window(utilization: (dict?["used_percentage"] as? NSNumber)?.doubleValue,
+                          resetsAt: (dict?["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) })
+        }
+        let usage = Usage(fiveHour: window(json["five_hour"]), sevenDay: window(json["seven_day"]))
+        return (usage, min(Date(timeIntervalSince1970: updatedAt), Date()))
+    }
+}
+
 enum UsageFormatter {
     static func titleText(_ usage: Usage, _ now: Date) -> String {
         "Limit: 5h \(percent(usage.fiveHour)) 7d \(percent(usage.sevenDay))"
@@ -611,6 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var nextFetch = Date()
     private var lastAttempt: Date?
     private var failures = 0
+    private var holdUntil: Date?      // the server rate limited us; no requests at all before this
     private var screensAsleep = false
 
     private let menu = NSMenu()
@@ -691,6 +715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Fetching
 
     private func tick() {
+        absorbLocalUsage()
         fetchIfDue()
         render()
     }
@@ -704,13 +729,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // shows when the next try is) and does nothing right after another request.
     @objc private func refreshNow() {
         let now = Date()
-        if case .rateLimited = lastError, nextFetch > now { render(); return }
-        if let lastAttempt, now.timeIntervalSince(lastAttempt) < RefreshPolicy.manualGap { return }
+        absorbLocalUsage()
+        if let holdUntil, holdUntil > now { render(); return }
+        if let lastAttempt, now.timeIntervalSince(lastAttempt) < RefreshPolicy.manualGap { render(); return }
         fetch()
     }
 
     private func fetch() {
         guard !isFetching else { return }
+        // Numbers Claude Code saved within the polling interval are as good as a request would get.
+        if absorbLocalUsage(), let lastUpdated, Date().timeIntervalSince(lastUpdated) < RefreshPolicy.interval {
+            render()
+            return
+        }
         isFetching = true
         lastAttempt = Date()
         Task { @MainActor in
@@ -719,15 +750,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 lastUpdated = Date()
                 lastError = nil
                 failures = 0
+                holdUntil = nil
             } catch {
                 lastError = error as? UsageError ?? .offline
                 failures += 1
             }
             nextFetch = Date().addingTimeInterval(RefreshPolicy.delay(after: lastError, failures: failures))
+            if case .rateLimited = lastError { holdUntil = nextFetch }
             isFetching = false
+            // The request failed, so fall back to Claude Code's numbers if they are newer than ours.
+            if lastError != nil { absorbLocalUsage() }
             saveState()
             render()
         }
+    }
+
+    // Takes the numbers from Claude Code's status line file when they are newer than the ones shown.
+    // Recent numbers there also clear the error (the numbers on screen are current) and push the next
+    // request back a full interval. Returns whether anything newer was found.
+    @discardableResult
+    private func absorbLocalUsage() -> Bool {
+        guard let local = LocalUsage.read(), local.updated > (lastUpdated ?? .distantPast) else { return false }
+        lastUsage = local.usage
+        lastUpdated = local.updated
+        if Date().timeIntervalSince(local.updated) < RefreshPolicy.interval {
+            lastError = nil
+            failures = 0
+            nextFetch = max(nextFetch, local.updated.addingTimeInterval(RefreshPolicy.interval))
+        }
+        saveState()
+        return true
     }
 
     @objc private func didWake() {
@@ -751,29 +803,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var usage: Usage?
         var updated: Date?
         var nextFetch: Date
-        var rateLimited: Bool
+        var holdUntil: Date?
     }
 
     private static let savedStateKey = "savedState"
 
     private func saveState() {
-        var rateLimited = false
-        if case .rateLimited = lastError { rateLimited = true }
-        let state = SavedState(usage: lastUsage, updated: lastUpdated, nextFetch: nextFetch, rateLimited: rateLimited)
+        let state = SavedState(usage: lastUsage, updated: lastUpdated, nextFetch: nextFetch, holdUntil: holdUntil)
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: Self.savedStateKey)
         }
     }
 
     private func restoreState() {
+        defer { absorbLocalUsage() }
         guard let data = UserDefaults.standard.data(forKey: Self.savedStateKey),
               let state = try? JSONDecoder().decode(SavedState.self, from: data) else { return }
         let now = Date()
         lastUsage = state.usage
         lastUpdated = state.updated
-        if state.rateLimited {
+        if let hold = state.holdUntil, hold > now {
+            holdUntil = min(hold, now.addingTimeInterval(RefreshPolicy.maxHold))
+            nextFetch = holdUntil ?? now
             lastError = .rateLimited(retryAfter: nil)
-            nextFetch = min(state.nextFetch, now.addingTimeInterval(RefreshPolicy.maxHold))
         } else if let updated = state.updated, state.usage != nil {
             nextFetch = min(updated.addingTimeInterval(RefreshPolicy.interval), now.addingTimeInterval(RefreshPolicy.interval))
         }

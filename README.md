@@ -77,6 +77,18 @@ The usage endpoint is rate limited per account, and Claude Code uses the same al
 - Other failures, such as no network, are retried after 1 minute, then 2 and 4 minutes, and then every 5 minutes.
 - No requests are sent while the displays are asleep.
 - The last numbers and any rate-limit wait are saved, so quitting and reopening the app shows the numbers straight away and does not send a request early.
+- A rate limit never hides the numbers: the last ones stay on screen, with a note saying when the next try is.
+
+### Using Claude Code's own numbers
+
+Claude Code passes the same limits to its [status line](https://docs.claude.com/en/docs/claude-code/statusline) command every time it updates. If your status line script saves them to `~/.claude/rate-limits.json`, the app reads that file every minute and uses it whenever it is newer than its own numbers. While Claude Code is in use this means the app hardly sends requests at all, and when the usage endpoint is rate limiting, the numbers keep updating anyway.
+
+Add this to your status line script, where `$input` is the JSON Claude Code passes on stdin:
+
+```bash
+printf '%s' "$input" | jq -c '{five_hour: .rate_limits.five_hour, seven_day: .rate_limits.seven_day, updated_at: (now | floor)}' \
+  > ~/.claude/rate-limits.json.tmp && mv ~/.claude/rate-limits.json.tmp ~/.claude/rate-limits.json
+```
 
 ### Notch island
 
@@ -123,6 +135,8 @@ Limit: 5h 4% 7d 18%  |  Reset on: 5h 4h 22m 7d 2d 5h
 4. The app adds up the widths of all menu bar icons on the notched screen, including ones macOS has hidden behind the notch. If they plus the stats don't fit right of the notch, the stats are shown in the notch island instead of the menu bar.
 
 The token is only sent to `api.anthropic.com`. It is not stored or logged by this app.
+
+If `~/.claude/rate-limits.json` exists (see [Using Claude Code's own numbers](#using-claude-codes-own-numbers)), its numbers are used instead of a request whenever they are newer.
 
 The usage endpoint is undocumented and may change without notice. If it does, the app will show an error until it is updated.
 
